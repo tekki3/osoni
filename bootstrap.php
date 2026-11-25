@@ -39,6 +39,7 @@ require_once __DIR__ . '/framework/Database.php';
 require_once __DIR__ . '/framework/Query.php';
 require_once __DIR__ . '/framework/Model.php';
 require_once __DIR__ . '/framework/Migrator.php';
+require_once __DIR__ . '/framework/MigrationSchema.php';
 require_once __DIR__ . '/framework/mail/MailSocket.php';
 require_once __DIR__ . '/framework/mail/Message.php';
 require_once __DIR__ . '/framework/mail/Mime.php';

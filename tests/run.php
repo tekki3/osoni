@@ -319,6 +319,48 @@ try {
         same(0, (int) $app->db->execute('SELECT COUNT(*) FROM migrations')->fetchColumn());
     });
 
+    test('CLI imports existing SQLite table structures without copying rows or the migration ledger', static function () use ($app, $temp): void {
+        $source = $app->db->pdo();
+        $source->exec('CREATE TABLE import_parent (id INTEGER PRIMARY KEY, label TEXT NOT NULL)');
+        $source->exec('CREATE TABLE import_child (
+            id INTEGER PRIMARY KEY,
+            parent_id INTEGER NOT NULL REFERENCES import_parent(id),
+            detail TEXT NOT NULL CHECK (length(detail) > 0)
+        )');
+        $source->exec('CREATE INDEX import_child_detail_idx ON import_child(detail)');
+        $source->exec("INSERT INTO import_parent (id, label) VALUES (1, 'source row')");
+        $source->exec("INSERT INTO import_child (id, parent_id, detail) VALUES (1, 1, 'source row')");
+        $files = [];
+        try {
+            console($app, ['make:migration:import', 'import_legacy_schema']);
+            $files = glob($temp . '/database/migrations/*_import_legacy_schema.php');
+            same(1, count($files));
+            $contents = (string) file_get_contents($files[0]);
+            token_get_all($contents, TOKEN_PARSE);
+            check(str_contains($contents, 'import_parent'));
+            check(str_contains($contents, 'import_child_detail_idx'));
+            check(!str_contains($contents, 'source row'));
+            check(!str_contains($contents, 'CREATE TABLE migrations'));
+
+            $target = new PDO('sqlite::memory:', options: [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
+            $target->exec('PRAGMA foreign_keys = ON');
+            $migration = require $files[0];
+            $migration->up($target);
+            same(0, (int) $target->query('SELECT COUNT(*) FROM import_parent')->fetchColumn());
+            same(1, (int) $target->query("SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'import_child_detail_idx'")->fetchColumn());
+            same(1, count($target->query('PRAGMA foreign_key_list(import_child)')->fetchAll()));
+            $migration->down($target);
+            same(0, (int) $target->query("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN ('import_parent', 'import_child')")->fetchColumn());
+            same(2, (int) $source->query('SELECT (SELECT COUNT(*) FROM import_parent) + (SELECT COUNT(*) FROM import_child)')->fetchColumn());
+        } finally {
+            foreach ($files as $file) {
+                unlink($file);
+            }
+            $source->exec('DROP TABLE IF EXISTS import_child');
+            $source->exec('DROP TABLE IF EXISTS import_parent');
+        }
+    });
+
     test('CLI form generator renders all supported controls with CSRF and safe values', static function () use ($app, $temp): void {
         $fields = ['full_name:text', 'email:email', 'password:password', 'message:textarea',
             'quantity:number', 'birthday:date', 'alarm:time', 'appointment:datetime-local', 'website:url', 'phone:tel', 'agree:checkbox'];

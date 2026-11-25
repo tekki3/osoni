@@ -52,6 +52,7 @@ Usage: php osoni <command> [name] [--force]
   make:form folder.name field:type ...  Create a Osoni POST form view
   view:clear                 Remove compiled templates
   make:migration name        Create an up/down migration
+  make:migration:import name Import existing table structures into a migration
   make:seeder Name           Create a seeder
   migrate                    Run pending migrations
   migrate:status             List migrations and batch numbers
@@ -120,7 +121,7 @@ TEXT;
             return 0;
         }
         $mailCommands = ['mail:queue', 'mail:list', 'mail:show', 'mail:send', 'mail:work', 'mail:retry', 'mail:fetch'];
-        $allowsName = in_array($command, ['serve', 'make:controller', 'make:api', 'make:model', 'make:view', 'make:template', 'make:migration', 'make:seeder', 'db:seed', ...$mailCommands], true);
+        $allowsName = in_array($command, ['serve', 'make:controller', 'make:api', 'make:model', 'make:view', 'make:template', 'make:migration', 'make:migration:import', 'make:seeder', 'db:seed', ...$mailCommands], true);
         if (count($arguments) > ($allowsName ? 1 : 0)) {
             throw new InvalidArgumentException('Too many arguments. Use php osoni help.');
         }
@@ -202,6 +203,7 @@ TEXT;
             case 'make:view':
             case 'make:template':
             case 'make:migration':
+            case 'make:migration:import':
             case 'make:seeder':
                 if ($name === null) {
                     throw new InvalidArgumentException('Provide a name.');
@@ -549,13 +551,17 @@ declare(strict_types=1);
 <h1><?= e($title ?? 'New page') ?></h1>
 
 PHP);
-        } elseif ($command === 'make:migration') {
+        } elseif ($command === 'make:migration' || $command === 'make:migration:import') {
             if (!preg_match('/^[a-z][a-z0-9_]{0,100}$/D', $name)) {
                 throw new InvalidArgumentException('Use snake_case for migrations (up to 101 characters).');
             }
             $stamp = (new \DateTimeImmutable('now', new \DateTimeZone('UTC')))->format('YmdHisu');
             $path = "/database/migrations/{$stamp}_$name.php";
-            $content = <<<'PHP'
+            if ($command === 'make:migration:import') {
+                $schema = MigrationSchema::capture($this->app->db->pdo(), $this->app->db->driver());
+                $content = MigrationSchema::migrationSource($schema);
+            } else {
+                $content = <<<'PHP'
 <?php
 declare(strict_types=1);
 
@@ -574,6 +580,7 @@ return new class extends Migration {
 };
 
 PHP;
+            }
         } else {
             if (!preg_match('/^[A-Z][a-zA-Z0-9]{0,100}$/D', $name)
                 || token_get_all('<?php ' . $name)[1][0] !== T_STRING

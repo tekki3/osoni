@@ -5843,6 +5843,7 @@ processes to the new key, and only then resume writes. Replacing
 
 ```sh
 php osoni make:migration create_messages
+php osoni make:migration:import import_legacy_schema
 php osoni migrate
 php osoni migrate:status
 php osoni migrate:rollback
@@ -5853,6 +5854,11 @@ php osoni db:seed MessageSeeder
 Fill in the generated `up(PDO $db)` and `down(PDO $db)` first.
 The templates intentionally throw an exception until implemented:
 this prevents an empty migration from being incorrectly recorded as run.
+`make:migration:import` instead captures the configured database's table
+definitions, indexes, keys, and constraints (not row data), excluding Osoni's
+`migrations` ledger. It reads but does not change the source database. Review
+the generated, driver-specific DDL; it is intended for a fresh database using
+the same driver and schema setup, not to be applied back to the source.
 Files are sorted by timestamp. Each run forms a batch;
 rollback reverses **the entire last batch**.
 Do not modify or delete applied migrations; create a new migration.
