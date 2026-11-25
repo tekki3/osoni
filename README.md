@@ -1913,6 +1913,8 @@ model property assignment is introduced.
   and retains only fields covered by rules.
 - `toArray()` returns the current values.
 - `write($path, $options)` writes the current array and returns the pipeline.
+- `insertStatements($table, $driver)` builds parameterized insert statements
+  and bindings without executing them.
 
 This is an **eager**, copy-on-write array pipeline. Every transformation returns
 a new pipeline; previous arrays remain unchanged. It is not a streaming
@@ -3089,7 +3091,7 @@ spacing outside that character set may require Word instead.
 
 ## Structured File Reading
 
-Read CSV, JSON, XML, YAML, and YML with one API after loading bootstrap:
+Read XLSX, CSV, JSON, XML, YAML, and YML with one API after loading bootstrap:
 
 ```php
 use Osoni\FileReader;
@@ -3104,9 +3106,9 @@ $data = FileReader::read($app->root . '/storage/import/data.txt', [
 ```
 
 Extensions are case-insensitive. `format` overrides the extension; supported
-values are `csv`, `json`, `xml`, `yaml`, and `yml`. Every `read()` result is
+values are `xlsx`, `csv`, `json`, `xml`, `yaml`, and `yml`. Every `read()` result is
 a PHP array, never a parser object. This does **not** make every format have
-the same schema: CSV produces rows, JSON/YAML preserve their data tree, and XML
+the same schema: XLSX/CSV produce rows, JSON/YAML preserve their data tree, and XML
 uses the explicit node structure below. JSON/YAML scalar roots are rejected;
 empty mappings and lists both become `[]`.
 
@@ -3122,7 +3124,7 @@ importing. Readers never evaluate PHP from input.
 
 The default `max_bytes` is **16 MiB**, including any BOM, even for streamed
 CSV. Set a positive integer explicitly for larger trusted workloads.
-`max_depth` defaults to 64 and accepts 1..256 for JSON/XML/YAML; it is not
+`max_depth` defaults to 64 and accepts 1..256 for XLSX/JSON/XML/YAML; it is not
 relevant to flat CSV records. XML also limits elements to 100000. YAML
 normalization limits its traversal to 100000 values/containers to reject cyclic
 or excessively expanding aliases. Whole-document parsers still need memory
@@ -3134,6 +3136,69 @@ directory allowlist, upload validator, schema validator, or permission system.
 Do not pass arbitrary request paths directly to `read()`; select authorized
 private files, validate required fields/types, and escape imported values when
 rendering. CSV strings beginning with spreadsheet formulas remain unchanged.
+
+### Excel XLSX import and conversion
+
+The native XLSX reader requires PHP's `zip` and `dom` extensions. It reads a
+single worksheet, selected by zero-based index (default `0`) or exact name:
+
+```php
+use Osoni\Data;
+
+$data = Data::read($app->root . '/storage/import/customers.xlsx', [
+    'sheet' => 'Customers',
+    'headers' => true,
+]);
+$data->write($app->root . '/storage/export/customers.csv');
+$data->write($app->root . '/storage/export/customers.json');
+$data->write($app->root . '/storage/export/customers.yaml'); // Requires ext-yaml.
+```
+
+Create the destination directory first; existing files are not overwritten.
+CSV formula-injection protection is enabled by default and may prefix dangerous
+cells with an apostrophe. YAML output requires the native ext-yaml extension.
+All output uses the existing `Data` writer options and limits.
+
+The first nonempty row supplies unique, nonempty string headers. Set `headers`
+to `false` for positional rows, or to a list of names to include the first row
+as data. Blank rows are skipped; missing cells become empty strings. Rows with
+cells beyond the header width fail. Numbers, including date serials, remain
+their exact stored strings; booleans become PHP booleans. Shared/inline text
+and cached formula results are read, but formulas are never calculated.
+Missing or empty formula caches and Excel error cells fail explicitly. Formatting,
+date conversion, merged-cell expansion, hidden-row filtering, and legacy
+`.xls` are not supported. Validate the workbook and its values for your use.
+
+The archive is bounded by `max_bytes` (16 MiB default) and
+`max_uncompressed_bytes` (64 MiB default, maximum 256 MiB), with at most
+4096 archive entries, 100000 XML elements per part and 100000 returned
+cells. DTDs, external worksheet relationships, encrypted entries and unsafe
+archive paths are rejected. Parsing is eager; apply process memory and time
+limits. `iterate()` is not supported for XLSX.
+
+To prepare database inserts, first map headers to an application-owned column
+allowlist and validate the values. Then use parameterized statements and
+bindings; do not concatenate values or execute statements selected by a user:
+
+```php
+$rows = $data->map(static fn (array $row): array => [
+    'name' => $row['name'],
+    'email' => $row['email'],
+])->validate(['*.name' => 'required|string', '*.email' => 'required|email']);
+$statements = $rows->insertStatements('customers', $app->db->driver());
+$app->db->transaction(function () use ($app, $statements): void {
+    foreach ($statements as $statement) {
+        $app->db->execute($statement['sql'], $statement['parameters']);
+    }
+});
+```
+
+The `sql` and `parameters` pairs can also be exported as JSON with
+`Data::from($statements)->write(...)`. They are not standalone SQL scripts:
+execute the SQL with its associated bindings. Only simple identifiers are
+accepted and quoted for SQLite, MySQL, PostgreSQL, or SQL Server. Identifier
+quoting is not authorization; choose the table and columns in trusted code.
+No database changes occur until the application explicitly executes them.
 
 ### CSV rows and streaming
 
@@ -3176,7 +3241,7 @@ quotes is rejected by the strict CSV syntax.
 Choose transaction boundaries/idempotency for partial imports. Memory use is
 proportional to the largest record, not total row count. The generator closes
 its file when exhausted or destroyed; unset an iterator you retain after an
-early break. JSON, XML, and YAML currently reject `iterate()` explicitly rather
+early break. XLSX, JSON, XML, and YAML currently reject `iterate()` explicitly rather
 than pretending to stream a fully buffered document.
 
 ### JSON data trees
@@ -3262,7 +3327,7 @@ unreadable, oversized files, malformed data, and unavailable extensions throw
 through your application's existing logger/error response; do not expose
 private paths or imported data to users.
 
-`CsvReader`, `JsonReader`, `XmlReader`, and `YamlReader` live in
+`ExcelReader`, `CsvReader`, `JsonReader`, `XmlReader`, and `YamlReader` live in
 `Osoni\Readers` and implement `ReaderInterface`. Each is usable directly.
 To add a format, explicitly require trusted application code implementing
 `read(string $path, array $options = []): array` and

@@ -3,6 +3,7 @@ declare(strict_types=1);
 
 use Osoni\FileReader;
 use Osoni\Readers\CsvReader;
+use Osoni\Readers\ExcelReader;
 use Osoni\Readers\JsonReader;
 use Osoni\Readers\XmlReader;
 use Osoni\Readers\YamlReader;
@@ -14,6 +15,78 @@ function readerFixture(string $contents, string $extension): string
     file_put_contents($path, $contents);
     return $path;
 }
+
+function excelReaderFixture(string $sheet, string $strings = ''): string
+{
+    $main = 'http://schemas.openxmlformats.org/spreadsheetml/2006/main';
+    $rel = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships';
+    $parts = [
+        '[Content_Types].xml' => '<Types/>',
+        '_rels/.rels' => '<Relationships/>',
+        'xl/workbook.xml' => '<workbook xmlns="' . $main . '" xmlns:r="' . $rel . '"><sheets><sheet name="Import" sheetId="1" r:id="r1"/></sheets></workbook>',
+        'xl/_rels/workbook.xml.rels' => '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+            . '<Relationship Id="r1" Type="' . $rel . '/worksheet" Target="worksheets/sheet1.xml"/>'
+            . ($strings === '' ? '' : '<Relationship Id="r2" Type="' . $rel . '/sharedStrings" Target="sharedStrings.xml"/>')
+            . '</Relationships>',
+        'xl/worksheets/sheet1.xml' => $sheet,
+    ];
+    if ($strings !== '') {
+        $parts['xl/sharedStrings.xml'] = $strings;
+    }
+    return readerFixture(\Osoni\Documents\Documents::package($parts, 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', 'xlsx')->contents, 'xlsx');
+}
+
+test('Excel reads generated workbooks, selects sheets and preserves scalar values and escaped text', static function (): void {
+    $workbook = \Osoni\Documents\Documents::excel()
+        ->sheet('First', [['name', 'total', 'active'], ['Ada', 12.5, true], ['_x0041_', null, false]])
+        ->sheet('Second', [['item'], ['value']])->build();
+    $path = readerFixture($workbook->contents, 'XLSX');
+    $expected = [['name' => 'Ada', 'total' => '12.5', 'active' => true], ['name' => '_x0041_', 'total' => '', 'active' => false]];
+    same($expected, FileReader::read($path));
+    same($expected, (new ExcelReader())->read($path));
+    same([['item' => 'value']], FileReader::read($path, ['sheet' => 'Second']));
+    same([['item'], ['value']], FileReader::read($path, ['sheet' => 1, 'headers' => false]));
+    same([['label' => 'item'], ['label' => 'value']], FileReader::read($path, ['sheet' => 1, 'headers' => ['label']]));
+    raises(static fn () => FileReader::read($path, ['sheet' => 'Missing']), RuntimeException::class);
+    raises(static fn () => FileReader::read($path, ['sheet' => -1]), InvalidArgumentException::class);
+    raises(static fn () => FileReader::iterate($path), RuntimeException::class);
+});
+
+test('Excel reads shared and rich strings, sparse cells, cached formulas and exact numeric text', static function (): void {
+    $main = 'http://schemas.openxmlformats.org/spreadsheetml/2006/main';
+    $strings = '<sst xmlns="' . $main . '"><si><t>name</t></si><si><t>amount</t></si><si><t>active</t></si>'
+        . '<si><r><t>Ca</t></r><r><t>fé_x0021_</t></r><rPh><t>ignored</t></rPh></si>'
+        . '<si><t>_x0041__x0042__xD83D__xDE00__x005F_x0041_</t></si></sst>';
+    $sheet = '<worksheet xmlns="' . $main . '"><sheetData>'
+        . '<row r="1"><c r="A1" t="s"><v>0</v></c><c r="B1" t="s"><v>1</v></c><c r="C1" t="s"><v>2</v></c></row>'
+        . '<row r="3"><c r="A3" t="s"><v>3</v></c><c r="B3"><f>1+1</f><v>9007199254740993</v></c><c r="C3" t="b"><v>0</v></c></row>'
+        . '<row r="4"><c r="A4" t="s"><v>4</v></c><c r="C4" t="b"><v>1</v></c></row></sheetData></worksheet>';
+    $path = excelReaderFixture($sheet, $strings);
+    same([['name' => 'Café!', 'amount' => '9007199254740993', 'active' => false],
+        ['name' => 'AB😀_x0041_', 'amount' => '', 'active' => true]], FileReader::read($path));
+});
+
+test('Excel rejects unsafe archives, XML, ambiguous data and invalid limits', static function (): void {
+    $main = 'http://schemas.openxmlformats.org/spreadsheetml/2006/main';
+    foreach ([
+        '<!DOCTYPE worksheet [<!ENTITY x SYSTEM "file:///etc/passwd">]><worksheet xmlns="' . $main . '"><sheetData/></worksheet>',
+        '<worksheet xmlns="' . $main . '"><sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>name</t></is></c></row><row r="2"><c r="A2"><f>1+1</f></c></row></sheetData></worksheet>',
+        '<worksheet xmlns="' . $main . '"><sheetData><row r="1"><c r="A1"><f>1+1</f><v/></c></row></sheetData></worksheet>',
+        '<worksheet xmlns="' . $main . '"/>',
+        '<worksheet xmlns="' . $main . '"><sheetData><row r="1"><c r="A1" t="s"><v>9</v></c></row></sheetData></worksheet>',
+        '<worksheet xmlns="' . $main . '"><sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>name</t></is></c></row><row r="2"><c r="B2"><v>1</v></c></row></sheetData></worksheet>',
+        '<worksheet xmlns="' . $main . '"><sheetData><row r="1"><c r="A1" t="e"><v>#REF!</v></c></row></sheetData></worksheet>',
+    ] as $sheet) {
+        raises(static fn () => FileReader::read(excelReaderFixture($sheet)), RuntimeException::class);
+    }
+    $path = excelReaderFixture('<worksheet xmlns="' . $main . '"><sheetData/></worksheet>');
+    raises(static fn () => FileReader::read($path, ['max_uncompressed_bytes' => 1]), RuntimeException::class);
+    raises(static fn () => FileReader::read($path, ['max_uncompressed_bytes' => 0]), InvalidArgumentException::class);
+    raises(static fn () => FileReader::read($path, ['headers' => ['x', 'x']]), InvalidArgumentException::class);
+    raises(static fn () => FileReader::read(readerFixture('not a ZIP', 'xlsx')), RuntimeException::class);
+    $unsafe = \Osoni\Documents\Documents::package(['../outside' => 'x'], 'application/zip', 'xlsx');
+    raises(static fn () => FileReader::read(readerFixture($unsafe->contents, 'xlsx')), RuntimeException::class);
+});
 
 test('File readers detect case-insensitive extensions, explicit formats, and trusted custom readers', static function (): void {
     $path = readerFixture('{"nested":{"list":[1,true,null,{"name":"value"}]},"big":92233720368547758080}', 'JSON');

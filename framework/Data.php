@@ -11,6 +11,7 @@ use RuntimeException;
 require_once __DIR__ . '/FileReader.php';
 require_once __DIR__ . '/Validator.php';
 require_once __DIR__ . '/Filesystem.php';
+require_once __DIR__ . '/Query.php';
 require_once __DIR__ . '/documents/DocumentFile.php';
 require_once __DIR__ . '/documents/Documents.php';
 
@@ -81,6 +82,37 @@ final class Data
     public function toArray(): array
     {
         return $this->values;
+    }
+
+    /** @return list<array{sql: string, parameters: list<string|int|float|bool|null>}> */
+    public function insertStatements(string $table, string $driver): array
+    {
+        $table = Query::identifier($table, $driver);
+        if (!array_is_list($this->values)) {
+            throw new InvalidArgumentException('Insert statements require a list of associative rows.');
+        }
+        $statements = [];
+        foreach ($this->values as $row) {
+            if (!is_array($row) || $row === [] || array_is_list($row)) {
+                throw new InvalidArgumentException('Insert statements require nonempty associative rows.');
+            }
+            $columns = [];
+            $values = [];
+            foreach ($row as $column => $value) {
+                if (!is_string($column) || (!is_string($value) && !is_int($value) && !is_bool($value)
+                    && $value !== null && !(is_float($value) && is_finite($value)))) {
+                    throw new InvalidArgumentException('Insert columns must be names and values must be finite scalars or null.');
+                }
+                $columns[] = Query::identifier($column, $driver);
+                $values[] = $value;
+            }
+            $statements[] = [
+                'sql' => 'INSERT INTO ' . $table . ' (' . implode(', ', $columns) . ') VALUES ('
+                    . implode(', ', array_fill(0, count($columns), '?')) . ')',
+                'parameters' => $values,
+            ];
+        }
+        return $statements;
     }
 
     public function write(string $path, array $options = []): self

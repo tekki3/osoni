@@ -117,6 +117,39 @@ test('Data reads CSV then filters, normalizes, validates and writes JSON without
     same(['name' => 'Ada'], Data::read($directory . '/input.data', ['format' => 'json'])->toArray());
 });
 
+test('Excel data exports and parameterized insert statements preserve untrusted values', static function (): void {
+    global $temp, $root;
+    $input = $temp . '/import.xlsx';
+    \Osoni\Documents\Documents::excel()->sheet('People', [
+        ['name', 'notes'], ['Ada', "'; DROP TABLE people; --"], ['=formula', 'hello'],
+    ])->build()->save($input);
+    $data = Data::read($input);
+    $data->write($temp . '/excel-export.json')->write($temp . '/excel-export.csv');
+    same($data->toArray(), Data::read($temp . '/excel-export.json')->toArray());
+    same([['name' => 'Ada', 'notes' => "'; DROP TABLE people; --"], ['name' => "'=formula", 'notes' => 'hello']],
+        Data::read($temp . '/excel-export.csv')->toArray());
+    if (extension_loaded('yaml')) {
+        $data->write($temp . '/excel-export.yaml');
+        same($data->toArray(), Data::read($temp . '/excel-export.yaml')->toArray());
+    } else {
+        raises(static fn () => $data->write($temp . '/excel-export.yaml'), RuntimeException::class);
+    }
+    $db = new \Osoni\Database($root, ['driver' => 'sqlite', 'database' => ':memory:']);
+    $db->execute('CREATE TABLE people (name TEXT, notes TEXT)');
+    $statements = $data->insertStatements('people', $db->driver());
+    same('INSERT INTO `people` (`name`, `notes`) VALUES (?, ?)', $statements[0]['sql']);
+    foreach ($statements as $statement) {
+        $db->execute($statement['sql'], $statement['parameters']);
+    }
+    same($data->toArray(), $db->execute('SELECT name, notes FROM people ORDER BY rowid')->fetchAll());
+    same('INSERT INTO "people" ("name", "notes") VALUES (?, ?)', $data->insertStatements('people', 'pgsql')[0]['sql']);
+    same('INSERT INTO [people] ([name], [notes]) VALUES (?, ?)', $data->insertStatements('people', 'sqlsrv')[0]['sql']);
+    raises(static fn () => $data->insertStatements('people; DROP TABLE people', 'sqlite'), InvalidArgumentException::class);
+    raises(static fn () => Data::from([['name; DROP TABLE people' => 'x']])->insertStatements('people', 'sqlite'), InvalidArgumentException::class);
+    raises(static fn () => Data::from([['name' => ['nested']]])->insertStatements('people', 'sqlite'), InvalidArgumentException::class);
+    raises(static fn () => $data->insertStatements('people', 'unknown'), InvalidArgumentException::class);
+});
+
 test('Data whole-document XML mapper can flatten secure reader nodes and write JSON', static function (): void {
     global $temp;
     $directory = $temp . '/data-xml';

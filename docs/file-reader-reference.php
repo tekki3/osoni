@@ -3,11 +3,11 @@ declare(strict_types=1);
 
 return [
     'Osoni\\FileReader' => [
-        'description' => 'Static entry point for bounded local CSV, JSON, XML, and YAML/YML reading. Explicitly loaded by bootstrap; no database, Application instance, Composer, or autoloader is required. See Structured File Reading for exact output shapes and trust boundaries.',
+        'description' => 'Static entry point for bounded local XLSX, CSV, JSON, XML, and YAML/YML reading. Explicitly loaded by bootstrap; no database, Application instance, Composer, or autoloader is required. See Structured File Reading for exact output shapes and trust boundaries.',
         'setup' => 'use Osoni\\FileReader;',
         'methods' => [
             'read' => ['Detect a case-insensitive extension or accept options["format"]. Return arrays only. Unknown options/formats and invalid arguments throw InvalidArgumentException; missing/unreadable/oversized files, missing extensions, and invalid content throw RuntimeException. Default max_bytes is 16777216; max_depth is 64 (1..256).', '$rows = \\Osoni\\FileReader::read($path, ["format" => "csv", "headers" => true]);'],
-            'iterate' => ['Stream CSV rows lazily with the same options and row shape as read(). The file opens on iteration; errors can occur after earlier rows were yielded. JSON/XML/YAML reject streaming explicitly. Release an abandoned generator to close its file.', 'foreach (\\Osoni\\FileReader::iterate($path, ["format" => "csv"]) as $row) { processRow($row); }'],
+            'iterate' => ['Stream CSV rows lazily with the same options and row shape as read(). The file opens on iteration; errors can occur after earlier rows were yielded. XLSX/JSON/XML/YAML reject streaming explicitly. Release an abandoned generator to close its file.', 'foreach (\\Osoni\\FileReader::iterate($path, ["format" => "csv"]) as $row) { processRow($row); }'],
             'register' => ['Register a trusted ReaderInterface implementation by format/extension. Names are case-insensitive ASCII alphanumeric identifiers starting with a letter, up to 32 characters. Overrides persist for this PHP process; no class names are loaded from file content.', '\\Osoni\\FileReader::register("data", new \\Osoni\\Readers\\JsonReader());'],
         ],
     ],
@@ -24,6 +24,13 @@ return [
         'methods' => [
             'read' => ['Collect all streamed rows in an array. headers defaults true (first nonblank record); false yields lists; a nonempty unique name list supplies headers without consuming a record. delimiter defaults comma, enclosure double quote, escape empty, skip_empty_lines true. Nonempty CSV controls are distinct single bytes excluding CR, LF and NUL. Header rows require matching record widths.', '$rows = $reader->read($path, ["headers" => true, "delimiter" => ";", "escape" => ""]);'],
             'iterate' => ['Yield one validated row at a time without retaining previous records. Supports multiline quoted cells and doubled enclosures. Invalid UTF-8, unterminated quotes, characters after closing quotes, duplicate/empty headers and inconsistent header widths throw. Memory is proportional to the largest record, not total rows; max_bytes still limits the whole file.', 'foreach ($reader->iterate($path, ["headers" => ["id", "name"]]) as $row) { processRow($row); }'],
+        ],
+    ],
+    'Osoni\\Readers\\ExcelReader' => [
+        'description' => 'Eager XLSX worksheet reader using native zip and DOM. No formula execution, XLS support, spreadsheet formatting, or streaming.',
+        'setup' => '$reader = new \\Osoni\\Readers\\ExcelReader();',
+        'methods' => [
+            'read' => ['Read a worksheet by zero-based sheet index or exact name (default 0); headers=true consumes the first nonempty row, false returns positional rows, or supply a unique name list. Missing cells are empty strings, numeric values remain exact strings, booleans are booleans, formulas use cached results, and errors or missing/empty formula caches throw. Shared and inline text are supported. Archive expansion, XML depth/elements, and returned cells are bounded; max_uncompressed_bytes defaults to 64 MiB and accepts 1..256 MiB.', '$rows = $reader->read($path, ["sheet" => "Customers", "headers" => true]);'],
         ],
     ],
     'Osoni\\Readers\\JsonReader' => [

@@ -5,6 +5,7 @@ namespace Osoni;
 
 use InvalidArgumentException;
 use Osoni\Readers\CsvReader;
+use Osoni\Readers\ExcelReader;
 use Osoni\Readers\JsonReader;
 use Osoni\Readers\ReaderInterface;
 use Osoni\Readers\XmlReader;
@@ -13,6 +14,7 @@ use Osoni\Readers\YamlReader;
 require_once __DIR__ . '/readers/ReaderInterface.php';
 require_once __DIR__ . '/readers/Reader.php';
 require_once __DIR__ . '/readers/CsvReader.php';
+require_once __DIR__ . '/readers/ExcelReader.php';
 require_once __DIR__ . '/readers/JsonReader.php';
 require_once __DIR__ . '/readers/XmlReader.php';
 require_once __DIR__ . '/readers/YamlReader.php';
@@ -47,6 +49,7 @@ final class FileReader
         unset($options['format']);
         return self::$readers[$format] ?? match ($format) {
             'csv' => new CsvReader(),
+            'xlsx' => new ExcelReader(),
             'json' => new JsonReader(),
             'xml' => new XmlReader(),
             'yaml', 'yml' => new YamlReader(),
