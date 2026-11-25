@@ -1,0 +1,118 @@
+<?php
+declare(strict_types=1);
+
+/** @return array{Osoni\Database, SqlServerRecordingPdo} */
+function pgsqlRecordingDatabase(): array
+{
+    global $temp;
+    $db = new \Osoni\Database($temp, ['driver' => 'pgsql', 'database' => 'test']);
+    $pdo = new SqlServerRecordingPdo('pgsql');
+    (new ReflectionProperty(\Osoni\Database::class, 'connection'))->setValue($db, $pdo);
+    return [$db, $pdo];
+}
+
+test('PostgreSQL quotes identifiers, binds values, and uses LIMIT/OFFSET and RETURNING', static function (): void {
+    [$db, $pdo] = pgsqlRecordingDatabase();
+    same('"order"', \Osoni\Query::identifier('order', 'pgsql'));
+    raises(static fn () => \Osoni\Query::identifier('id"; DROP TABLE users', 'pgsql'), InvalidArgumentException::class);
+    $db->table('notes')->where('title', 'Ada')->orderBy('id')->limit(5)->offset(10)->get();
+    same('SELECT * FROM "notes" WHERE "title" = ? ORDER BY "id" ASC LIMIT 5 OFFSET 10', end($pdo->sql));
+    same([1 => ['Ada', PDO::PARAM_STR]], end($pdo->bindings));
+    same(42, $db->table('notes')->insert(['title' => 'café']));
+    same('INSERT INTO "notes" ("title") VALUES (?) RETURNING "id"', end($pdo->sql));
+    same(42, $db->table('articles')->insert([], 'article_id'));
+    same('INSERT INTO "articles" DEFAULT VALUES RETURNING "article_id"', end($pdo->sql));
+    same(0, $db->table('settings')->insert(['code' => 'theme'], null));
+    same('INSERT INTO "settings" ("code") VALUES (?)', end($pdo->sql));
+    $db->table('notes')->where('id', 42)->update(['title' => 'Revised']);
+    same('UPDATE "notes" SET "title" = ? WHERE "id" = ?', end($pdo->sql));
+    $db->table('notes')->where('id', 42)->delete();
+    same('DELETE FROM "notes" WHERE "id" = ?', end($pdo->sql));
+    $db->table('notes')->whereIn('id', [1, 2])->exists();
+    same('SELECT 1 FROM "notes" WHERE "id" IN (?, ?) LIMIT 1', end($pdo->sql));
+    raises(static fn () => $db->table('notes')->delete(), LogicException::class);
+    $db->ensureRateLimit('api_limits', 'bucket', 100);
+    same('INSERT INTO "api_limits" (bucket, expires_at) VALUES (?, ?) ON CONFLICT(bucket) DO NOTHING', end($pdo->sql));
+});
+
+test('PostgreSQL row locks require a transaction and follow pagination clauses', static function (): void {
+    [$db, $pdo] = pgsqlRecordingDatabase();
+    $query = $db->table('notes')->where('id', 42)->lockForUpdate();
+    raises(static fn () => $query->first(), LogicException::class);
+    $pdo->transaction = true;
+    $query->first();
+    same('SELECT * FROM "notes" WHERE "id" = ? LIMIT 1 FOR UPDATE', end($pdo->sql));
+    same([1 => [42, PDO::PARAM_INT]], end($pdo->bindings));
+    raises(static fn () => $query->paginate(), LogicException::class);
+});
+
+test('PostgreSQL duplicate registration and IMAP import avoid aborted transactions', static function (): void {
+    [$db, $pdo] = pgsqlRecordingDatabase();
+    $mail = new \Osoni\Mail\Mailer($db, ['from' => 'noreply@example.test']);
+    $auth = new \Osoni\Auth($db, new \Osoni\Session(), $mail, 'http://127.0.0.1:8000', false);
+    $pdo->columnResults = [false];
+    $auth->register(['name' => 'Ada', 'email' => 'ada@example.test',
+        'password' => 'A long password 42!', 'password_confirmation' => 'A long password 42!'], '127.0.0.1');
+    same(1, $pdo->commits);
+    same(0, $pdo->rollbacks);
+    check(str_contains(end($pdo->sql), 'ON CONFLICT (email) DO NOTHING RETURNING id'));
+    check(!str_contains(implode("\n", $pdo->sql), 'INSERT INTO "emails"'));
+    $record = ['source_key' => str_repeat('a', 64), 'uid' => '1', 'uidvalidity' => '1', 'mailbox' => 'INBOX',
+        'raw' => 'raw', 'message' => ['from' => 'ada@example.test', 'to' => 'receiver@example.test',
+            'subject' => 'Hello', 'text' => 'Body', 'html' => '', 'message_id' => '', 'headers' => []]];
+    $pdo->columnResults = [false, '52'];
+    same(52, $db->transaction(static fn () => $mail->store->receive($record)));
+    check(str_contains(implode("\n", $pdo->sql), 'ON CONFLICT (source_key) DO NOTHING RETURNING id'));
+    same(2, $pdo->commits);
+});
+
+test('PostgreSQL migrations use overrides, identity columns, transactions and advisory locks', static function (): void {
+    global $root, $temp;
+    [$db, $pdo] = pgsqlRecordingDatabase();
+    $migrator = new \Osoni\Migrator($db, $root);
+    $files = (new ReflectionMethod($migrator, 'files'))->invoke($migrator);
+    same(9, count($files));
+    foreach ($files as $file) {
+        check(str_contains($file, '/pgsql/') || basename($file) === '20261113220000_create_sessions.php'
+            || str_ends_with($file, '_create_background_work.php') || str_ends_with($file, '_create_auth_mfa.php')
+            || str_ends_with($file, '_create_auth_identities.php') || str_ends_with($file, '_rename_scheduler_tasks.php'),
+            'PostgreSQL override not selected.');
+        (require $file)->up($pdo);
+    }
+    $schema = implode("\n", $pdo->sql);
+    check(str_contains($schema, 'GENERATED BY DEFAULT AS IDENTITY'));
+    check(str_contains($schema, 'COLLATE "C"'));
+    check(!str_contains($schema, 'AUTOINCREMENT') && !str_contains($schema, 'NVARCHAR'));
+    (new ReflectionMethod($migrator, 'atomic'))->invoke($migrator, static fn () => true);
+    same(1, $pdo->commits);
+    raises(static fn () => (new ReflectionMethod($migrator, 'atomic'))->invoke($migrator, static function (): void {
+        throw new RuntimeException('Rollback.');
+    }), RuntimeException::class);
+    same(1, $pdo->rollbacks);
+    $isolated = new \Osoni\Migrator($db, $temp);
+    (new ReflectionMethod($isolated, 'locked'))->invoke($isolated, static fn () => true);
+    check(str_contains(end($pdo->sql), 'pg_advisory_unlock'));
+    $pdo->lockResult = -1;
+    raises(static fn () => (new ReflectionMethod($isolated, 'locked'))->invoke($isolated, static fn () => true), RuntimeException::class);
+});
+
+test('PostgreSQL validates DSN fields and TLS settings before opening a connection', static function (): void {
+    global $temp;
+    $config = ['driver' => 'pgsql', 'database' => 'osoni', 'host' => 'localhost', 'port' => '5432'];
+    foreach ([
+        ['host' => 'localhost;sslmode=disable'], ['database' => "db' user=other"],
+        ['database' => 'db;sslmode=disable'], ['port' => '0'], ['port' => '65536'],
+        ['sslmode' => 'verfy-full'], ['sslrootcert' => "ca';sslmode=disable"],
+        ['sslrootcert' => $temp . '/missing-ca.pem'],
+    ] as $invalid) {
+        raises(static fn () => (new \Osoni\Database($temp, array_replace($config, $invalid)))->pdo(), RuntimeException::class);
+    }
+    if (!in_array('pgsql', PDO::getAvailableDrivers(), true)) {
+        try {
+            (new \Osoni\Database($temp, $config))->pdo();
+            throw new LogicException('Expected missing driver diagnostic.');
+        } catch (RuntimeException $error) {
+            check(str_contains($error->getMessage(), 'pdo_pgsql'));
+        }
+    }
+});

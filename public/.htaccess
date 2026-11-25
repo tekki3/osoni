@@ -1,0 +1,11 @@
+Options -Indexes -MultiViews
+DirectoryIndex index.php
+RewriteEngine On
+RewriteRule .* - [E=HTTP_AUTHORIZATION:%{HTTP:Authorization}]
+RewriteRule (^|/)\. - [F,END]
+RewriteRule ^index\.php$ - [END]
+RewriteRule \.(?:php[0-9]?|phtml|phar)(?:/|$) - [F,END,NC]
+RewriteRule \.(?:env|sqlite[0-9]?|log|ini|config|sql|bak)$ - [F,END,NC]
+RewriteCond %{REQUEST_FILENAME} -f
+RewriteRule \.(?:css|js|png|jpg|jpeg|gif|webp|ico|svg|woff2?)$ - [END,NC]
+RewriteRule ^ index.php [QSA,END]

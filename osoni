@@ -1,0 +1,15 @@
+#!/usr/bin/env php
+<?php
+declare(strict_types=1);
+
+try {
+    $app = require __DIR__ . '/bootstrap.php';
+    require_once __DIR__ . '/framework/Console.php';
+    exit((new \Osoni\Console($app))->run(array_slice($argv, 1)));
+} catch (Throwable $error) {
+    if (isset($app) && !$error instanceof InvalidArgumentException) {
+        \Osoni\Logger::report($error, $app->log);
+    }
+    fwrite(STDERR, 'Error: ' . $error->getMessage() . PHP_EOL);
+    exit(1);
+}

@@ -1,0 +1,212 @@
+<?php
+declare(strict_types=1);
+
+namespace Osoni;
+
+use Throwable;
+
+final class Application
+{
+    public readonly Router $router;
+    public readonly View $views;
+    public readonly Formatter $format;
+    public readonly Translator $translator;
+    public readonly Strings $strings;
+    public readonly Ai $ai;
+    public readonly Cache $cache;
+    public readonly Session $session;
+    public readonly Database $db;
+    public readonly \Osoni\Mail\Mailer $mail;
+    public readonly Auth $auth;
+    public readonly Oidc $sso;
+    public readonly Encryption $encryption;
+    public readonly BotProtection $botProtection;
+    public readonly Api $api;
+    public readonly Uploads $uploads;
+    public readonly Logger $log;
+    public readonly ExceptionHandler $exceptions;
+    public readonly Storage $storage;
+    public readonly string $storagePath;
+    public readonly \Osoni\Queue\Queue $queue;
+    public readonly \Osoni\Scheduler\Schedule $schedule;
+    public readonly \Osoni\Scheduler\Scheduler $scheduler;
+    public readonly \Osoni\Worker\Worker $worker;
+    private bool $backgroundLoaded = false;
+
+    /** @param array{name: string, storage_path?: string, storage?: array<string, mixed>, locale?: string, timezone?: string, url?: string, key?: string, api_docs?: bool, upload_max_bytes?: int, log_retention_days?: int, log_level?: string, environment: string, debug: bool, secure_cookie: bool, session?: array{driver?: 'native'|'database', lifetime?: int, lock_timeout?: int}, database: array<string, string>, auth?: array{mfa_enrollment_enabled?: bool, mfa_enforcement_enabled?: bool, email_composer?: (callable('reset'|'verify', string, int): array{subject: string, text: string, html: string})|null}, sso?: array{enabled?: bool, name?: string, issuer?: string, client_id?: string, client_secret?: string, timeout?: int, ca_file?: string}, mail?: array{log?: bool, from?: string, smtp?: array<string, string>, imap?: array<string, string>}, cache?: array<string, mixed>, scheduler?: array<string, mixed>, queue?: array<string, mixed>, ai?: array{provider?: string, timeout?: int, max_tokens?: int, ca_file?: string, openai?: array{key?: string, model?: string}, anthropic?: array{key?: string, model?: string}}} $config */
+    public function __construct(public readonly string $root, #[\SensitiveParameter] public readonly array $config)
+    {
+        $auth = $config['auth'] ?? [];
+        if (!is_array($auth)) {
+            throw new \InvalidArgumentException('Authentication configuration must be an array.');
+        }
+        foreach (['mfa_enrollment_enabled', 'mfa_enforcement_enabled'] as $setting) {
+            if (array_key_exists($setting, $auth) && !is_bool($auth[$setting])) {
+                throw new \InvalidArgumentException("Authentication setting $setting must be a boolean.");
+            }
+        }
+        $this->storagePath = Filesystem::databasePath($root, ($config['storage_path'] ?? '') !== '' ? $config['storage_path'] : 'storage');
+        $this->router = new Router();
+        $this->log = new Logger($root, $config['log_retention_days'] ?? 5, $config['log_level'] ?? 'debug', $this->storagePath);
+        $this->storage = new Storage($root, $config['storage'] ?? [], $this->storagePath);
+        $this->uploads = new Uploads($root, $config['upload_max_bytes'] ?? 2097152, $this->storagePath);
+        $this->format = new Formatter($config['locale'] ?? 'en-US', $config['timezone'] ?? 'UTC');
+        $this->translator = new Translator($root . '/app/lang', $config['locale'] ?? 'en-US');
+        $this->strings = new Strings();
+        $this->ai = new Ai($config['ai'] ?? []);
+        $this->cache = new Cache($config['cache'] ?? []);
+        $this->views = new View($root . '/app/views', $this->storagePath . '/views', formatter: $this->format, strings: $this->strings,
+            storageRoot: $root, storagePath: $this->storagePath, translator: $this->translator);
+        $this->exceptions = new ExceptionHandler($config['environment'], $config['debug'], $this->log, $this->views);
+        $session = $config['session'] ?? [];
+        if (!in_array($session['driver'] ?? 'native', ['native', 'database'], true)) {
+            throw new \InvalidArgumentException('SESSION_DRIVER must be native or database.');
+        }
+        $this->session = new Session(($session['driver'] ?? 'native') === 'database'
+            ? new DatabaseSessionHandler(new Database($root, $config['database'], production: $config['environment'] === 'production'),
+                $root, $this->storagePath, $session['lifetime'] ?? 7200, $session['lock_timeout'] ?? 10)
+            : null);
+        $this->botProtection = new BotProtection($this->session);
+        $this->encryption = new Encryption($config['key'] ?? '');
+        $this->db = new Database($root, $config['database'], $this->encryption, $config['environment'] === 'production');
+        $this->mail = new \Osoni\Mail\Mailer($this->db, $config['mail'] ?? []);
+        $this->auth = new Auth($this->db, $this->session, $this->mail, $config['url'] ?? 'http://127.0.0.1:8000',
+            $config['environment'] === 'production', $auth['email_composer'] ?? null,
+            $auth['mfa_enrollment_enabled'] ?? true, $auth['mfa_enforcement_enabled'] ?? true);
+        $this->sso = new Oidc($this->session, $config['sso'] ?? [], $config['url'] ?? 'http://127.0.0.1:8000');
+        $this->api = new Api($this->db, $this->views, $config['name'], $config['api_docs'] ?? $config['environment'] !== 'production', $this->log, $this->exceptions);
+        $registry = new \Osoni\Queue\JobRegistry(function (\Osoni\Queue\JobRegistry $registry): void {
+            $app = $this;
+            $path = $this->root . '/routes/jobs.php';
+            $jobs = is_file($path) ? require $path : [];
+            if (!is_array($jobs)) {
+                throw new \RuntimeException('routes/jobs.php must return a job registry array.');
+            }
+            foreach ($jobs as $type => $job) {
+                if (!is_string($type) || $type === 'scheduled-task' || !is_array($job)
+                    || !is_callable($job['validate'] ?? null) || !is_callable($job['handle'] ?? null)) {
+                    throw new \RuntimeException('Each job type requires explicit validate and handle callbacks.');
+                }
+                $registry->register($type, $job['validate'], $job['handle']);
+            }
+        });
+        $registry->register('scheduled-task', static function (array $payload): void {
+            if (array_keys($payload) !== ['task_key', 'definition_hash']
+                || !is_string($payload['task_key']) || !is_string($payload['definition_hash'])
+                || preg_match('/^[a-f0-9]{64}$/D', $payload['definition_hash']) !== 1) {
+                throw new \InvalidArgumentException('Invalid scheduled task payload.');
+            }
+        }, function (array $payload, \Osoni\Queue\ExecutionContext $context): void {
+            $this->background();
+            $this->scheduler->executeTask($payload['task_key'], $payload['definition_hash'], $context);
+        });
+        $queueConfig = $config['queue'] ?? [];
+        $schedulerConfig = $config['scheduler'] ?? [];
+        $this->queue = new \Osoni\Queue\Queue($this->db, $this->log, $registry, $queueConfig);
+        $this->schedule = new \Osoni\Scheduler\Schedule($schedulerConfig['timezone'] ?? 'UTC');
+        $this->scheduler = new \Osoni\Scheduler\Scheduler($this->db, $this->queue, $this->schedule, $schedulerConfig, app: $this);
+        $this->worker = new \Osoni\Worker\Worker($this, $this->queue, $queueConfig);
+    }
+
+    public function background(): void
+    {
+        if ($this->backgroundLoaded) {
+            return;
+        }
+        $path = $this->root . '/routes/schedule.php';
+        if (is_file($path)) {
+            $register = require $path;
+            if (!is_callable($register)) {
+                throw new \RuntimeException('routes/schedule.php must return a schedule registration callback.');
+            }
+            $register($this->schedule, $this);
+        }
+        $this->backgroundLoaded = true;
+    }
+
+    public function routes(): void
+    {
+        $app = $this;
+        $router = $this->router;
+        require $this->root . '/routes/web.php';
+        $api = $this->api;
+        if (is_file($this->root . '/routes/api.php')) {
+            require $this->root . '/routes/api.php';
+        }
+    }
+
+    public function handle(Request $request): Response
+    {
+        if (Api::matches($request->path)) {
+            return $this->api->dispatch($request);
+        }
+        $this->session->verifyCsrf($request);
+        if ($this->session->isReadOnly($request->method)) {
+            // Read methods carry no token. A read request that only matches handlers
+            // for methods which change data (a form rewritten to GET) is refused here;
+            // anything else keeps its normal response, including 404 and 405.
+            $methods = $this->router->methodsFor($request->path);
+            if ($methods !== [] && !in_array('GET', $methods, true) && !in_array($request->method, $methods, true)) {
+                throw new HttpException(405, 'HTTP method not allowed.', ['Allow' => implode(', ', $methods)]);
+            }
+        }
+        return $this->router->dispatch($request);
+    }
+
+    public function readiness(): Response
+    {
+        try {
+            (new Diagnostics($this))->ready();
+            return Response::json(['status' => 'ready']);
+        } catch (Throwable $error) {
+            Logger::report($error, $this->log);
+            return Response::json(['status' => 'not_ready'], 503);
+        }
+    }
+
+    public function run(): void
+    {
+        $apiRequest = Api::matches(rawurldecode(explode('?', $_SERVER['REQUEST_URI'] ?? '/', 2)[0]));
+        $request = null;
+        try {
+            $https = isset($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off';
+            if ($this->config['environment'] === 'production' && !$this->config['secure_cookie'] && !$https) {
+                throw new \RuntimeException('Production requires HTTPS or SESSION_SECURE_COOKIE=true behind an HTTPS proxy.');
+            }
+            $probe = in_array(explode('?', $_SERVER['REQUEST_URI'] ?? '/', 2)[0], ['/health', '/ready'], true)
+                && in_array($_SERVER['REQUEST_METHOD'] ?? 'GET', ['GET', 'HEAD'], true);
+            if (!$apiRequest && !$probe) {
+                $this->session->start($https || $this->config['secure_cookie']);
+            }
+            $this->routes();
+            $request = Request::capture();
+            $response = $this->handle($request);
+        } catch (Throwable $error) {
+            $contentType = strtolower(trim(explode(';', $_SERVER['CONTENT_TYPE'] ?? $_SERVER['HTTP_CONTENT_TYPE'] ?? '')[0]));
+            $response = $this->exceptions->render($error, $request, $apiRequest || ($request === null && $contentType === 'application/json'));
+        }
+        try {
+            $this->session->close();
+        } catch (Throwable $error) {
+            if (session_status() === PHP_SESSION_ACTIVE) {
+                session_abort();
+            }
+            $response = $this->exceptions->render($error, $request, $apiRequest);
+        }
+        try {
+            $response->send(($_SERVER['REQUEST_METHOD'] ?? '') === 'HEAD');
+        } catch (Throwable $error) {
+            if (headers_sent()) {
+                Logger::report($error, $this->log);
+                throw $error;
+            }
+            $response = $this->exceptions->render($error, $request, $apiRequest);
+            $response->send(($_SERVER['REQUEST_METHOD'] ?? '') === 'HEAD');
+        }
+    }
+
+    public static function errorResponse(Throwable $error, bool $debug = false, ?Logger $logger = null): Response
+    {
+        return (new ExceptionHandler($debug ? 'local' : 'production', $debug, $logger))->render($error);
+    }
+}

@@ -1,0 +1,176 @@
+<?php
+declare(strict_types=1);
+
+namespace Osoni\Mail;
+
+use InvalidArgumentException;
+use Osoni\Database;
+use RuntimeException;
+
+final class MailStore
+{
+    public function __construct(private readonly Database $db)
+    {
+    }
+
+    public function queue(Message $message): int
+    {
+        return (int) $this->db->insert('emails', [
+            'direction' => 'outgoing', 'status' => 'queued', 'from_address' => $message->from,
+            'to_addresses' => json_encode($message->to, JSON_THROW_ON_ERROR),
+            'subject' => $message->subject, 'text_body' => $message->text, 'html_body' => $message->html,
+            'message_id' => $message->messageId, 'headers_json' => '{}', 'raw_message' => '',
+            'created_at' => self::now(), 'updated_at' => self::now(),
+        ]);
+    }
+
+    /** @param array{source_key: string, uid: string, uidvalidity: string, mailbox: string, raw: string, message: array<string, mixed>} $incoming */
+    public function receive(array $incoming): int
+    {
+        $message = $incoming['message'];
+        try {
+            $data = [
+                'direction' => 'incoming', 'status' => 'received', 'from_address' => $message['from'],
+                'to_addresses' => json_encode([$message['to']], JSON_THROW_ON_ERROR),
+                'subject' => $message['subject'], 'text_body' => $message['text'], 'html_body' => $message['html'],
+                'message_id' => $message['message_id'], 'headers_json' => json_encode($message['headers'], JSON_THROW_ON_ERROR),
+                'raw_message' => base64_encode($incoming['raw']), 'source_key' => $incoming['source_key'],
+                'mailbox' => $incoming['mailbox'], 'imap_uid' => $incoming['uid'], 'imap_uidvalidity' => $incoming['uidvalidity'],
+                'created_at' => self::now(), 'updated_at' => self::now(),
+            ];
+            if ($this->db->driver() === 'pgsql') {
+                $statement = $this->db->execute(
+                    'INSERT INTO emails (' . implode(', ', array_keys($data)) . ') VALUES ('
+                    . implode(', ', array_fill(0, count($data), '?'))
+                    . ') ON CONFLICT (source_key) DO NOTHING RETURNING id',
+                    array_values($data),
+                );
+                $id = $statement->fetchColumn();
+                $statement->closeCursor();
+                if ($id === false) {
+                    $id = $this->db->execute('SELECT id FROM emails WHERE source_key = ?', [$incoming['source_key']])->fetchColumn();
+                    if ($id === false) {
+                        throw new RuntimeException('The duplicate imported email no longer exists.');
+                    }
+                }
+            } else {
+                $id = $this->db->insert('emails', $data);
+            }
+        } catch (\PDOException $error) {
+            // Concurrent imports of the same UID are allowed; other database errors remain errors.
+            if ($this->db->driver() !== 'pgsql' && in_array((string) $error->getCode(), ['23000', '23505'], true)) {
+                $existing = $this->db->execute('SELECT id FROM emails WHERE source_key = ?', [$incoming['source_key']])->fetchColumn();
+                if ($existing !== false) {
+                    return (int) $existing;
+                }
+            }
+            throw $error;
+        }
+        return (int) $id;
+    }
+
+    public function known(string $sourceKey): bool
+    {
+        return $this->db->execute('SELECT id FROM emails WHERE source_key = ?', [$sourceKey])->fetchColumn() !== false;
+    }
+
+    /** @return array<string, mixed> */
+    public function find(int $id): array
+    {
+        if ($id < 1) {
+            throw new InvalidArgumentException('Email ID must be positive.');
+        }
+        $row = $this->db->execute('SELECT * FROM emails WHERE id = ?', [$id])->fetch();
+        if ($row === false) {
+            throw new RuntimeException("Email does not exist: $id");
+        }
+        return $row;
+    }
+
+    public function claim(int $id): Message
+    {
+        $row = $this->find($id);
+        if ($row['direction'] !== 'outgoing' || $row['status'] !== 'queued') {
+            throw new RuntimeException('Only outgoing emails with queued status can be sent.');
+        }
+        $message = new Message(
+            $row['from_address'], json_decode($row['to_addresses'], true, 32, JSON_THROW_ON_ERROR),
+            $row['subject'], $row['text_body'], $row['html_body'], $row['message_id'],
+        );
+        $changed = $this->db->execute(
+            "UPDATE emails SET status = 'sending', attempts = attempts + 1, last_error = NULL, updated_at = ?
+             WHERE id = ? AND direction = 'outgoing' AND status = 'queued'",
+            [self::now(), $id],
+        )->rowCount();
+        if ($changed !== 1) {
+            throw new RuntimeException('Another process has already claimed this email.');
+        }
+        return $message;
+    }
+
+    public function complete(int $id): void
+    {
+        $this->transition($id, 'sent', null, self::now());
+    }
+
+    public function fail(int $id, DeliveryException $error): void
+    {
+        $this->transition($id, $error->uncertain ? 'uncertain' : 'failed', $error->getMessage(), null);
+    }
+
+    public function retry(int $id, bool $force = false): void
+    {
+        $row = $this->find($id);
+        $allowed = $force ? ['failed', 'uncertain', 'sending'] : ['failed'];
+        if ($row['direction'] !== 'outgoing' || !in_array($row['status'], $allowed, true)) {
+            throw new RuntimeException('Only failed messages can be requeued; uncertain/sending requires explicit --force.');
+        }
+        if ($this->db->execute(
+            "UPDATE emails SET status = 'queued', updated_at = ? WHERE id = ? AND status = ? AND direction = 'outgoing'",
+            [self::now(), $id, $row['status']],
+        )->rowCount() !== 1) {
+            throw new RuntimeException('The email status was changed concurrently.');
+        }
+    }
+
+    /** @return list<array<string, mixed>> */
+    public function listing(int $limit = 50): array
+    {
+        self::limit($limit);
+        return $this->db->execute($this->db->limit(
+            'SELECT id, direction, status, subject, attempts, last_error, created_at, sent_at FROM emails ORDER BY id DESC', $limit,
+        ))->fetchAll();
+    }
+
+    /** @return list<int> */
+    public function pending(int $limit): array
+    {
+        self::limit($limit);
+        $rows = $this->db->execute($this->db->limit(
+            "SELECT id FROM emails WHERE direction = 'outgoing' AND status = 'queued' ORDER BY id", $limit,
+        ))->fetchAll();
+        return array_map(static fn (array $row): int => (int) $row['id'], $rows);
+    }
+
+    private function transition(int $id, string $status, ?string $error, ?string $sentAt): void
+    {
+        if ($this->db->execute(
+            "UPDATE emails SET status = ?, last_error = ?, sent_at = ?, updated_at = ? WHERE id = ? AND status = 'sending'",
+            [$status, $error, $sentAt, self::now(), $id],
+        )->rowCount() !== 1) {
+            throw new RuntimeException('Cannot save the delivery status; check the SMTP server before resending.');
+        }
+    }
+
+    private static function now(): string
+    {
+        return gmdate('Y-m-d\TH:i:s\Z');
+    }
+
+    private static function limit(int $limit): void
+    {
+        if ($limit < 1 || $limit > 1000) {
+            throw new InvalidArgumentException('Use a limit between 1 and 1000.');
+        }
+    }
+}
