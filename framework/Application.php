@@ -18,6 +18,7 @@ final class Application
     public readonly Database $db;
     public readonly \Osoni\Mail\Mailer $mail;
     public readonly Auth $auth;
+    public readonly Roles $roles;
     public readonly Oidc $sso;
     public readonly Encryption $encryption;
     public readonly BotProtection $botProtection;
@@ -69,6 +70,7 @@ final class Application
         $this->botProtection = new BotProtection($this->session);
         $this->encryption = new Encryption($config['key'] ?? '');
         $this->db = new Database($root, $config['database'], $this->encryption, $config['environment'] === 'production');
+        $this->roles = new Roles($this->db);
         $this->mail = new \Osoni\Mail\Mailer($this->db, $config['mail'] ?? []);
         $this->auth = new Auth($this->db, $this->session, $this->mail, $config['url'] ?? 'http://127.0.0.1:8000',
             $config['environment'] === 'production', $auth['email_composer'] ?? null,

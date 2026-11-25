@@ -21,6 +21,71 @@ function apiApplication(?string $applicationRoot = null): Application
     return $application;
 }
 
+test('Roles are explicitly assigned, validated, and removed with their user', static function (): void {
+    $application = apiApplication();
+    $roles = $application->roles;
+    foreach (['', 'Admin', ' admin', 'a b', 'a/', str_repeat('a', 65)] as $invalid) {
+        raises(static fn () => $roles->assign(1, $invalid), InvalidArgumentException::class);
+    }
+    raises(static fn () => $roles->has(0, 'admin'), InvalidArgumentException::class);
+    raises(static fn () => $roles->assign(999, 'admin'), PDOException::class);
+    $roles->assign(1, 'admin');
+    $roles->assign(1, 'editor');
+    check($roles->has(1, 'admin'));
+    check($roles->has(1, 'editor'));
+    raises(static fn () => $roles->assign(1, 'admin'), PDOException::class);
+    $roles->revoke(1, 'admin');
+    check(!$roles->has(1, 'admin'));
+    check($roles->has(1, 'editor'));
+    raises(static fn () => $roles->revoke(1, 'admin'), Osoni\RecordNotFoundException::class);
+    $application->db->execute('DELETE FROM users WHERE id = ?', [1]);
+    check(!$roles->has(1, 'editor'));
+});
+
+test('Browser role guards preserve login and verification checks and observe revocation', static function (): void {
+    $application = apiApplication();
+    $previous = $_SESSION ?? [];
+    try {
+        $_SESSION = [];
+        $guard = $application->auth->protect(static fn (Request $request, string $id): Response => new Response($id), role: 'admin');
+        $request = new Request('GET', '/admin/42');
+        same('/login', $guard($request, '42')->headers['Location']);
+        $_SESSION['_auth'] = ['id' => 1, 'version' => 1, 'issued' => time(), 'seen' => time()];
+        $application->db->execute('UPDATE users SET email_verified_at = NULL WHERE id = 1');
+        same('/email/verify', $guard($request, '42')->headers['Location']);
+        $application->db->execute('UPDATE users SET email_verified_at = ? WHERE id = 1', [time()]);
+        raises(static fn () => $guard($request, '42'), HttpException::class, 403);
+        $application->roles->assign(1, 'admin');
+        same('42', $guard($request, '42')->body);
+        $application->roles->revoke(1, 'admin');
+        raises(static fn () => $guard($request, '42'), HttpException::class, 403);
+        raises(static fn () => $application->auth->protect(static fn () => new Response(), role: ''), InvalidArgumentException::class);
+    } finally {
+        $_SESSION = $previous;
+    }
+});
+
+test('API role guards require bearer authentication and honor current role assignments', static function (): void {
+    $application = apiApplication();
+    $operation = ['summary' => 'Admin endpoint', 'operationId' => 'adminEndpoint', 'responses' => ['200' => ['description' => 'OK']]];
+    $handler = static fn (): Response => Response::json(['data' => 'ok']);
+    raises(static fn () => $application->api->add('GET', '/api/public-admin', $handler, $operation, authenticated: false, role: 'admin'), InvalidArgumentException::class);
+    raises(static fn () => $application->api->add('GET', '/api/bad-role', $handler, $operation, role: ''), InvalidArgumentException::class);
+    $application->api->add('GET', '/api/admin', $handler, $operation, role: 'admin');
+    $spec = $application->api->openApi()['paths']['/api/admin']['get'];
+    same('admin', $spec['x-required-role']);
+    check(isset($spec['responses']['403']));
+    same(401, $application->handle(new Request('GET', '/api/admin'))->status);
+    $token = $application->api->tokens->create(1)['token'];
+    $request = new Request('GET', '/api/admin', [], [], ['authorization' => 'Bearer ' . $token]);
+    same(403, $application->handle($request)->status);
+    $application->roles->assign(1, 'admin');
+    same(200, $application->handle($request)->status);
+    $application->roles->revoke(1, 'admin');
+    same(403, $application->handle($request)->status);
+    same(200, $application->handle(new Request('GET', '/api/me', [], [], ['authorization' => 'Bearer ' . $token]))->status);
+});
+
 test('API tokens require verified users and store only hashes', static function (): void {
     $application = apiApplication();
     $tokens = $application->api->tokens;

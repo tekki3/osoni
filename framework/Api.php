@@ -71,8 +71,14 @@ final class Api
     }
 
     /** @param array<string, mixed> $operation */
-    public function add(string $method, string $path, callable $handler, array $operation, bool $authenticated = true, bool $documented = true): void
+    public function add(string $method, string $path, callable $handler, array $operation, bool $authenticated = true, bool $documented = true, ?string $role = null): void
     {
+        if ($role !== null) {
+            Roles::validate($role);
+            if (!$authenticated) {
+                throw new InvalidArgumentException('A role requirement needs an authenticated API route.');
+            }
+        }
         $method = strtoupper($method);
         $path = rtrim($path, '/');
         if (!str_starts_with($path, '/api/') || preg_match('~^/api/(?:[a-zA-Z0-9_-]+|\{[a-zA-Z][a-zA-Z0-9_]*\})(?:/(?:[a-zA-Z0-9_-]+|\{[a-zA-Z][a-zA-Z0-9_]*\}))*$~D', $path) !== 1
@@ -113,9 +119,16 @@ final class Api
         if ($authenticated) {
             $operation['responses'] += ['401' => $error];
         }
-        $this->router->add($method, $path, function (Request $request, string ...$values) use ($handler, $authenticated): Response {
+        if ($role !== null) {
+            $operation['responses'] += ['403' => $error];
+            $operation['x-required-role'] = $role;
+        }
+        $this->router->add($method, $path, function (Request $request, string ...$values) use ($handler, $authenticated, $role): Response {
             if ($authenticated) {
                 $request = $request->withApiUser($this->tokens->authenticate($request->header('authorization')));
+            }
+            if ($role !== null && !(new Roles($this->db))->has($request->apiUser()['id'], $role)) {
+                throw new HttpException(403, 'You do not have permission to access this resource.');
             }
             $response = $handler($request, ...$values);
             if (!$response instanceof Response || !str_starts_with($response->headers['Content-Type'] ?? '', 'application/json')) {

@@ -63,15 +63,21 @@ final class Auth
         ];
     }
 
-    public function protect(callable $handler, bool $verified = true): \Closure
+    public function protect(callable $handler, bool $verified = true, ?string $role = null): \Closure
     {
-        return function (Request $request, string ...$parameters) use ($handler, $verified): Response {
+        if ($role !== null) {
+            Roles::validate($role);
+        }
+        return function (Request $request, string ...$parameters) use ($handler, $verified, $role): Response {
             $user = $this->user();
             if ($user === null) {
                 return Response::redirect('/login');
             }
             if ($verified && $user['email_verified_at'] === null) {
                 return Response::redirect('/email/verify');
+            }
+            if ($role !== null && !(new Roles($this->db))->has($user['id'], $role)) {
+                throw new HttpException(403, 'You do not have permission to access this resource.');
             }
             return $handler($request, ...$parameters);
         };

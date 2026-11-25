@@ -245,7 +245,7 @@ test('SQL Server migrations select overrides, use transactional DDL, and lock th
     [$db, $pdo] = sqlServerRecordingDatabase();
     $migrator = new \Osoni\Migrator($db, $root);
     $files = (new ReflectionMethod($migrator, 'files'))->invoke($migrator);
-    same(9, count($files));
+    same(10, count($files));
     foreach ($files as $file) {
         check(str_contains($file, '/sqlsrv/') || basename($file) === '20261113220000_create_sessions.php'
             || str_ends_with($file, '_create_background_work.php') || str_ends_with($file, '_create_auth_mfa.php')
@@ -254,6 +254,7 @@ test('SQL Server migrations select overrides, use transactional DDL, and lock th
         (require $file)->up($pdo);
     }
     $schema = implode("\n", $pdo->sql);
+    check(str_contains($schema, 'role_name VARCHAR(64) COLLATE Latin1_General_100_BIN2 NOT NULL'));
     check(str_contains($schema, 'IDENTITY(1,1)') && str_contains($schema, 'NVARCHAR(MAX)'), 'Missing SQL Server identity or Unicode text.');
     check(str_contains($schema, 'WHERE source_key IS NOT NULL'), 'Missing nullable unique filtered index.');
     check(!str_contains($schema, 'AUTO_INCREMENT') && !str_contains($schema, 'AUTOINCREMENT'), 'Foreign identity syntax found.');

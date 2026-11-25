@@ -252,7 +252,7 @@ authentication scaffolding.
 
 | Area | Osoni | Laravel 13.x | CodeIgniter 4 |
 |---|---|---|---|
-| Authentication | Included registration/login, verification, password reset, optional authenticator MFA, and database-backed bearer tokens; application-specific roles and record ownership remain your responsibility | Core authentication facilities; starter kits provide ready-made UI flows, with additional first-party packages for other authentication needs | Official Shield package provides authentication and authorization, including access tokens, roles, and permissions; it is separate from the core |
+| Authentication | Included registration/login, verification, password reset, optional authenticator MFA, database-backed bearer tokens and role guards; application-specific role assignment and record ownership remain your responsibility | Core authentication facilities; starter kits provide ready-made UI flows, with additional first-party packages for other authentication needs | Official Shield package provides authentication and authorization, including access tokens, roles, and permissions; it is separate from the core |
 | Sessions | Native PHP storage or opt-in database sessions; Redis/Memcached cache support does not add session drivers | Includes file, database, cookie, Redis, Memcached, DynamoDB, and nonpersistent array drivers, subject to prerequisites | Includes file, database, Redis, and Memcached session handlers, subject to driver prerequisites |
 | Shared cache | Native Redis or Memcached extensions; intentionally limited cache API | Multiple cache backends and a broader framework cache API | Built-in cache component with multiple handlers, including file, Redis, and Memcached |
 | Background work | Native scheduler and database-backed general-purpose queue with explicit job registries, retries and uncertain-work recovery; separate outgoing-email queue | General-purpose job queues, workers, retries, job chaining/batching, and task scheduling | General-purpose Queue and Tasks scheduler are available as separate official packages |
@@ -3587,7 +3587,8 @@ A token is valid only while the user exists, the email address is verified,
 the expiration date has not passed, and the stored `session_version` matches.
 Password reset therefore also invalidates **all existing API tokens**.
 Web logout removes only the web session; revoke API tokens separately.
-Tokens have no scopes/roles: they represent the user.
+Tokens have no independent scopes or roles: they represent the user, whose
+current roles can be checked by an API route guard.
 Always implement your own per-object authorization; a valid token does not
 automatically grant access to other users' data.
 
@@ -4948,9 +4949,46 @@ The guard redirects guests to `/login` and unverified accounts to `/email/verify
 There is no automatic redirect back to a supplied URL. Also protect your
 POST/PUT/PATCH/DELETE routes with the guard. Existing example routes remain
 public and work without auth tables as long as there is no signed-in session.
-Roles, per-object permissions, and remember-me are not included; add
-authorization before exposing user data. Optional external login is described
-in the Single Sign-On chapter below.
+Per-object permissions and remember-me are not included; add authorization
+before exposing user data. Optional external login is described in the
+Single Sign-On chapter below.
+
+### Role-Based Authorization
+
+Run `php osoni migrate` before using roles. Applications define their own role
+names and assign them only through trusted server-side code; registration and
+SSO do not grant any roles automatically. Do not accept a role assignment from
+an untrusted request or expose an assignment endpoint without its own
+authorization. A user may have multiple roles.
+
+```php
+// Trusted administration or a seeder, after identifying an existing user.
+$app->roles->assign($userId, 'admin');
+$app->roles->has($userId, 'admin'); // true
+$app->roles->revoke($userId, 'admin');
+
+// In routes/web.php; requires a verified session and the admin role.
+$router->get('/admin', $app->auth->protect([$controller, 'index'], role: 'admin'));
+
+// In an API route module; requires a bearer token and the admin role.
+$api->add('GET', '/api/admin', $handler, [
+    'summary' => 'Admin report',
+    'operationId' => 'adminReport',
+    'responses' => ['200' => ['description' => 'Report']],
+], role: 'admin');
+```
+
+Role names are 1–64 lowercase ASCII letters, digits, underscores or hyphens,
+starting with a letter. Duplicate assignments and missing users fail; revoking
+an absent assignment throws `RecordNotFoundException`. Role checks read the
+database on every guarded request, so changes affect existing sessions and
+tokens on the next check. Deleting a user deletes their role assignments.
+Guests and unverified users retain the normal web redirects; an authenticated
+user without the required role receives 403. The API returns 401 for a missing
+or invalid token and 403 for a valid user without the role. Role-protected
+operations document 403 and `x-required-role` in OpenAPI. Roles do not grant
+record ownership, protect existing routes automatically, or replace CSRF and
+per-record authorization.
 
 Sessions expire after 30 minutes of inactivity or a maximum of 12 hours from login.
 Each check reads the current user and session version from the database.
